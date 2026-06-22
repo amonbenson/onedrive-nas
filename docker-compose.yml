@@ -1,0 +1,68 @@
+# OneDrive NAS backup — Docker Compose
+#
+# A single service runs both the rclone mirror loop and the restic snapshot
+# loop (see scripts/orchestrator.sh). Add this service to your existing
+# home-automation compose project, or run it standalone from this directory.
+#
+# Quick start:
+#   1. cp .env.example .env   &&   edit .env  (set RESTIC_PASSWORD, DATA_DIR)
+#   2. docker compose build
+#   3. ./scripts/setup-rclone.sh         (one-time OneDrive auth)
+#   4. docker compose up -d
+#   5. docker compose logs -f
+
+services:
+  onedrive-nas:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: onedrive-nas:latest
+    container_name: onedrive-nas
+    restart: unless-stopped
+
+    # All tunables live in .env (see .env.example).
+    env_file:
+      - .env
+
+    environment:
+      # Paths INSIDE the container. Do not usually need changing — the host
+      # side is mapped below via DATA_DIR.
+      - MIRROR_DIR=/data/mirror
+      - RESTIC_REPOSITORY=/data/restic-repo
+      - TZ=${TZ:-UTC}
+
+    volumes:
+      # rclone config (rclone.conf). MUST be read-write: OneDrive refresh
+      # tokens are written back here. Losing write access => sync stops.
+      - ./config/rclone:/config/rclone
+
+      # The SSD. DATA_DIR on the host holds both the mirror and the restic repo.
+      # e.g. DATA_DIR=/mnt/ssd/onedrive-nas
+      - ${DATA_DIR}:/data
+
+    # rclone reads config from /config/rclone/rclone.conf by default in this
+    # image; RCLONE_CONFIG points there explicitly to be safe.
+    # restic reads RESTIC_REPOSITORY + RESTIC_PASSWORD from env_file.
+
+    # Resource caps tuned for a 1 GB Pi (~600 MB usable after OS + Docker).
+    # mem_limit:    hard RAM ceiling for the container.
+    # memswap_limit: RAM + swap total; lets restic prune page to SSD swap
+    #                when its index exceeds the RAM cap. Requires host swap
+    #                (e.g. dphys-swapfile on the Pi, pointing at the SSD).
+    mem_limit: ${MEM_LIMIT:-512m}
+    memswap_limit: ${MEM_SWAP_LIMIT:-2048m}
+    cpus: ${CPU_LIMIT:-1.5}
+
+    healthcheck:
+      # Healthy if the mirror directory exists and the process is alive.
+      test: ["CMD-SHELL", "test -d /data/mirror && pgrep -f orchestrator.sh >/dev/null || exit 1"]
+      interval: 2m
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

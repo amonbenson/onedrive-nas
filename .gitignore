@@ -1,0 +1,12 @@
+# Secrets — NEVER commit
+.env
+
+# rclone config contains OAuth tokens
+config/rclone/rclone.conf
+
+# Local restore scratch space
+restore/
+
+# Local data (should live on the SSD, not in the repo, but guard anyway)
+data/
+*.log

@@ -1,0 +1,9 @@
+.env
+.git
+.gitignore
+config/rclone/rclone.conf
+restore/
+data/
+*.log
+README.md
+docs/
