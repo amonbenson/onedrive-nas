@@ -22,7 +22,7 @@ IMAGE="${IMAGE:-onedrive-nas:latest}"
 
 [ -f "${ENV_FILE}" ] || { echo "Missing ${ENV_FILE}"; exit 1; }
 
-# Resolve the SSD data path from .env (DATA_DIR on the host).
+# Resolve the HDD data path from .env (DATA_DIR on the host).
 set -a
 # shellcheck disable=SC1090
 . "${ENV_FILE}"

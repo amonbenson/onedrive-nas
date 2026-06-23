@@ -36,8 +36,8 @@ services:
       # tokens are written back here. Losing write access => sync stops.
       - ./config/rclone:/config/rclone
 
-      # The SSD. DATA_DIR on the host holds both the mirror and the restic repo.
-      # e.g. DATA_DIR=/mnt/ssd/onedrive-nas
+      # The HDD. DATA_DIR on the host holds both the mirror and the restic repo.
+      # e.g. DATA_DIR=/mnt/hdd/onedrive-nas
       - ${DATA_DIR}:/data
 
     # rclone reads config from /config/rclone/rclone.conf by default in this
@@ -46,9 +46,9 @@ services:
 
     # Resource caps tuned for a 1 GB Pi (~600 MB usable after OS + Docker).
     # mem_limit:    hard RAM ceiling for the container.
-    # memswap_limit: RAM + swap total; lets restic prune page to SSD swap
-    #                when its index exceeds the RAM cap. Requires host swap
-    #                (e.g. dphys-swapfile on the Pi, pointing at the SSD).
+    # memswap_limit: RAM + swap total. WARNING: swap on a spinning HDD is very
+    #                slow; restic prune paging into HDD swap can stall for hours.
+    #                Prefer a Pi with 4 GB+ RAM over relying on HDD swap.
     mem_limit: ${MEM_LIMIT:-512m}
     memswap_limit: ${MEM_SWAP_LIMIT:-2048m}
     cpus: ${CPU_LIMIT:-1.5}

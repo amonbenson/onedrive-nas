@@ -1,7 +1,7 @@
 # OneDrive → Raspberry Pi NAS Backup: Implementation Manual
 
 **Audience:** Skilled developer implementing this system.
-**Goal:** A dockerized application running on a Raspberry Pi with an attached SSD that continuously mirrors a personal OneDrive account to local storage, retains files that were deleted online, and maintains generational (GFS) version history — all within a **4 TB SSD budget** for a **~2 TB OneDrive source**.
+**Goal:** A dockerized application running on a Raspberry Pi with an attached HDD that continuously mirrors a personal OneDrive account to local storage, retains files that were deleted online, and maintains generational (GFS) version history — all within a **4 TB HDD budget** for a **~2 TB OneDrive source**.
 
 ---
 
@@ -11,7 +11,7 @@
 
 | Requirement | Behaviour |
 |---|---|
-| Mirror entire OneDrive locally | Full copy of all files/folders on the SSD |
+| Mirror entire OneDrive locally | Full copy of all files/folders on the HDD |
 | Near-instant sync | Pick up new/changed files within minutes of upload |
 | **Never delete online-deleted files** | A file removed from OneDrive stays on the local mirror forever |
 | Update on overwrite | If a file changes online, the mirror holds the newest version |
@@ -26,7 +26,7 @@ This is **not** a single-tool job. The system is split into two cooperating stag
 ```
                   ┌─────────────────────────────────────────────┐
 OneDrive (2 TB) ──┤ STAGE 1: rclone copy                         │
-  personal acct   │  → /mnt/ssd/onedrive-mirror                  │
+  personal acct   │  → /mnt/hdd/onedrive-mirror                  │
                   │  Live mirror. Never deletes online-deleted   │
                   │  files. Always holds newest version of       │
                   │  files that still exist online.              │
@@ -35,7 +35,7 @@ OneDrive (2 TB) ──┤ STAGE 1: rclone copy                         │
                                       ▼
                   ┌─────────────────────────────────────────────┐
                   │ STAGE 2: restic snapshot + forget --prune    │
-                  │  → /mnt/ssd/restic-repo                       │
+                  │  → /mnt/hdd/restic-repo                       │
                   │  Deduplicated, GFS-thinned version history.   │
                   │  Daily / weekly / monthly retention tiers.    │
                   └─────────────────────────────────────────────┘
@@ -55,17 +55,17 @@ Do **not** attempt to build GFS retention out of rclone's `--backup-dir` alone �
 ### 2.1 Target hardware
 
 - Raspberry Pi (4 or 5 recommended; see memory note below).
-- SSD attached via USB3 (strongly prefer USB3 + a good UASP-capable enclosure over USB2).
-- SSD capacity: **4 TB**, formatted **ext4** (required for restic and for reliable hardlink/permissions behaviour; avoid exFAT/NTFS).
+- HDD attached via USB3 (strongly prefer USB3 + a good UASP-capable enclosure over USB2).
+- HDD capacity: **4 TB**, formatted **ext4** (required for restic and for reliable hardlink/permissions behaviour; avoid exFAT/NTFS).
 
 ### 2.2 The 4 TB budget — this is the central constraint
 
-The SSD must hold **both** the live mirror **and** the restic version repository:
+The HDD must hold **both** the live mirror **and** the restic version repository:
 
 ```
-4 TB SSD
-├── /mnt/ssd/onedrive-mirror   ← live mirror, tracks OneDrive (~2 TB) + online-deleted files
-└── /mnt/ssd/restic-repo       ← deduplicated GFS history of the mirror
+4 TB HDD
+├── /mnt/hdd/onedrive-mirror   ← live mirror, tracks OneDrive (~2 TB) + online-deleted files
+└── /mnt/hdd/restic-repo       ← deduplicated GFS history of the mirror
 ```
 
 Budget math the implementer must respect:
@@ -74,7 +74,7 @@ Budget math the implementer must respect:
 - **restic repo:** because of dedup, its size ≈ *unique data ever seen* + *metadata overhead*. For a mostly-static archive this is modest. For high-churn data it grows faster.
 - **Hard requirement:** mirror + repo **< 4 TB at all times.** The retention policy (Section 6) and the monitoring/safety guard (Section 8) exist specifically to enforce this.
 
-> ⚠️ **Critical:** restic dedups *within its own repo*, but the repo is *separate from* the mirror. The same bytes exist once in the mirror and (deduplicated) in the repo. Plan for mirror (~2–2.5 TB) + repo, and keep headroom. If projected usage approaches ~3.5 TB, the retention policy must be tightened. Never let it run to 100% — a full SSD will break both restic prune and rclone mid-write.
+> ⚠️ **Critical:** restic dedups *within its own repo*, but the repo is *separate from* the mirror. The same bytes exist once in the mirror and (deduplicated) in the repo. Plan for mirror (~2–2.5 TB) + repo, and keep headroom. If projected usage approaches ~3.5 TB, the retention policy must be tightened. Never let it run to 100% — a full HDD will break both restic prune and rclone mid-write.
 
 ### 2.3 Memory note (affects tool choice)
 
@@ -83,26 +83,40 @@ restic's initial snapshot and especially `prune` are CPU- and memory-hungry over
 - **Pi 5 / Pi 4 with 4–8 GB RAM:** fine. First snapshot may take many hours; subsequent incrementals are light.
 - **Pi with ≤2 GB RAM:** restic `prune` may struggle. Consider `rsnapshot` (hardlink-based, far lighter, no dedup hashing) as an alternative for Stage 2. This manual uses restic as primary; `rsnapshot` is noted as a fallback in Section 10.
 
-Add swap (e.g. 2–4 GB on the SSD or a separate device) to give restic prune headroom on memory-constrained Pis.
+Avoid relying on swap on the HDD — paging into a spinning disk during restic prune can stall the container for hours. Prefer a Pi with 4+ GB RAM, or raise `PRUNE_EVERY_N` to reduce how often the heavy prune operation runs.
 
 ---
 
 ## 3. Prerequisites
 
 1. Docker and Docker Compose installed on the Pi (the user already runs a home-automation compose stack — add to it or run a sibling stack).
-2. SSD mounted at a stable path, e.g. `/mnt/ssd`, via `/etc/fstab` (mount by `UUID=` so it survives reboots/replug). Confirm it mounts before Docker starts.
+2. HDD mounted at a stable path, e.g. `/mnt/hdd`, via `/etc/fstab` (mount by `UUID=` so it survives reboots/replug). Confirm it mounts before Docker starts.
 3. A machine **with a web browser** available once, to complete the OneDrive OAuth flow (the Pi is assumed headless).
 4. The `rclone/rclone` and `restic/restic` images are multi-arch and run natively on ARM.
 
-### 3.1 SSD mount example
+### 3.1 Formatting the HDD (one-time)
 
 ```bash
-# Find UUID
-sudo blkid
-# /etc/fstab line (ext4 example)
-UUID=xxxx-xxxx  /mnt/ssd  ext4  defaults,noatime  0  2
+sudo blkid                       # identify the disk (e.g. /dev/sdb)
+sudo umount /dev/sdb1 2>/dev/null
+sudo wipefs -a /dev/sdb          # clear any existing partition table / signatures
+sudo parted /dev/sdb --script mklabel gpt mkpart primary ext4 0% 100%
+sudo mkfs.ext4 -L onedrive-nas -m 1 /dev/sdb1
+# -L sets a volume label (makes blkid output readable)
+# -m 1 reserves only 1 % for root (default 5 % wastes ~200 GB on a 4 TB disk)
+```
 
-sudo mkdir -p /mnt/ssd/onedrive-mirror /mnt/ssd/restic-repo /mnt/ssd/config
+### 3.2 Mounting the HDD
+
+```bash
+# Find UUID of the new partition
+sudo blkid /dev/sdb1
+# /etc/fstab line — noatime and commit=60 reduce journal seek overhead on HDD;
+# nofail lets the Pi boot normally if the drive is absent (the orchestrator
+# detects a missing mount and exits rather than writing to the SD card).
+UUID=xxxx-xxxx  /mnt/hdd  ext4  defaults,noatime,commit=60,nofail  0  2
+
+sudo mkdir -p /mnt/hdd/onedrive-mirror /mnt/hdd/restic-repo /mnt/hdd/config
 sudo mount -a
 ```
 
@@ -127,11 +141,11 @@ rclone config
 rclone config file   # prints the path to rclone.conf
 ```
 
-Copy the resulting `rclone.conf` to the Pi at `/mnt/ssd/config/rclone/rclone.conf`.
+Copy the resulting `rclone.conf` to the Pi at `/mnt/hdd/config/rclone/rclone.conf`.
 
 > Alternatively, run config inside the container and use `rclone authorize "onedrive"` on the browser machine to obtain the token to paste back:
 > ```bash
-> docker run --rm -it -v /mnt/ssd/config/rclone:/config/rclone rclone/rclone config
+> docker run --rm -it -v /mnt/hdd/config/rclone:/config/rclone rclone/rclone config
 > ```
 
 > 🔑 **Token refresh:** OneDrive access tokens refresh automatically, and rclone **writes the refreshed token back into `rclone.conf`**. The config mount **must be read-write** (not `:ro`), or refresh will eventually fail and sync will stop.
@@ -141,14 +155,15 @@ Copy the resulting `rclone.conf` to the Pi at `/mnt/ssd/config/rclone/rclone.con
 ```sh
 rclone copy onedrive: /data/onedrive-mirror \
   --create-empty-src-dirs \
-  --transfers 4 \
-  --checkers 8 \
+  --transfers 1 \
+  --checkers 2 \
+  --buffer-size 16M \
   --log-level INFO
 ```
 
 - **`copy`, not `sync`** — this is the whole reason online-deleted files are retained. Do not change this to `sync`.
 - **`--create-empty-src-dirs`** — preserves empty folders.
-- **`--transfers 4 --checkers 8`** — keeps memory/CPU gentle on the Pi alongside Home Assistant. Tune up on a Pi 5 with good cooling; tune down if the Pi struggles.
+- **`--transfers 1 --checkers 2`** — a spinning HDD has one physical read/write head; multiple concurrent transfers cause random seeking which destroys throughput. Keep transfers at 1 for sequential access. A larger `--buffer-size 16M` lets rclone batch data into bigger sequential writes.
 - rclone decides a file *changed* by comparing modification time + size (and can use OneDrive's hash). When a newer version appears online, the local copy is overwritten with the newest version — exactly the intended behaviour. The only files that accumulate beyond the live OneDrive set are the **online-deleted** ones, which `copy` never removes.
 
 ### 4.3 Continuous operation — the loop pattern
@@ -169,8 +184,9 @@ while true; do
   echo "[mirror] $(date -Iseconds) starting rclone copy"
   rclone copy onedrive: /data/onedrive-mirror \
     --create-empty-src-dirs \
-    --transfers 4 \
-    --checkers 8 \
+    --transfers 1 \
+    --checkers 2 \
+    --buffer-size 16M \
     --log-level INFO \
     || echo "[mirror] $(date -Iseconds) copy exited non-zero (will retry next cycle)"
   echo "[mirror] $(date -Iseconds) copy finished, sleeping ${INTERVAL}s"
@@ -203,7 +219,7 @@ restic snapshots the **local mirror** (not OneDrive directly) on a schedule, int
 docker run --rm -it \
   -e RESTIC_REPOSITORY=/repo \
   -e RESTIC_PASSWORD='CHANGE_ME_STRONG_PASSWORD' \
-  -v /mnt/ssd/restic-repo:/repo \
+  -v /mnt/hdd/restic-repo:/repo \
   restic/restic init
 ```
 
@@ -278,7 +294,7 @@ Given a 2 TB source and 4 TB cap, start **conservative** and loosen only after o
 --keep-daily 7 --keep-weekly 4 --keep-monthly 6
 ```
 
-Then, if `restic stats` after several weeks shows comfortable headroom, extend `--keep-monthly` toward 12. It is far easier to *add* retention than to discover the SSD filled up.
+Then, if `restic stats` after several weeks shows comfortable headroom, extend `--keep-monthly` toward 12. It is far easier to *add* retention than to discover the HDD filled up.
 
 ---
 
@@ -287,7 +303,7 @@ Then, if `restic stats` after several weeks shows comfortable headroom, extend `
 ### 7.1 Directory layout on the Pi
 
 ```
-/mnt/ssd/
+/mnt/hdd/
 ├── config/
 │   └── rclone/
 │       └── rclone.conf            # generated in 4.1 (read-write!)
@@ -328,9 +344,9 @@ services:
     entrypoint: /scripts/stage1-mirror-loop.sh
     env_file: ./backup.env
     volumes:
-      - /mnt/ssd/config/rclone:/config/rclone          # read-write (token refresh)
+      - /mnt/hdd/config/rclone:/config/rclone          # read-write (token refresh)
       - ./stage1-mirror-loop.sh:/scripts/stage1-mirror-loop.sh:ro
-      - /mnt/ssd/onedrive-mirror:/data/onedrive-mirror
+      - /mnt/hdd/onedrive-mirror:/data/onedrive-mirror
 
   onedrive-restic:
     image: restic/restic:latest
@@ -341,8 +357,8 @@ services:
     env_file: ./backup.env
     volumes:
       - ./stage2-restic-loop.sh:/scripts/stage2-restic-loop.sh:ro
-      - /mnt/ssd/onedrive-mirror:/data/onedrive-mirror:ro   # restic reads mirror read-only
-      - /mnt/ssd/restic-repo:/repo
+      - /mnt/hdd/onedrive-mirror:/data/onedrive-mirror:ro   # restic reads mirror read-only
+      - /mnt/hdd/restic-repo:/repo
     depends_on:
       - onedrive-mirror
 ```
@@ -369,17 +385,17 @@ The initial mirror download of ~2 TB will take **many hours** (USB3 SSD, Pi-clas
 
 ## 8. Safety Guard: Enforce the 4 TB Cap
 
-Retention tuning is the *primary* control, but add an automated guard so a runaway repo can never fill the SSD and break both tools.
+Retention tuning is the *primary* control, but add an automated guard so a runaway repo can never fill the HDD and break both tools.
 
 ### 8.1 Disk-usage check (cron on the host, or a third tiny container)
 
 ```sh
 #!/bin/sh
-# /usr/local/bin/ssd-guard.sh  — run via host cron every hour
-USAGE=$(df --output=pcent /mnt/ssd | tail -1 | tr -dc '0-9')
-echo "$(date -Iseconds) SSD usage ${USAGE}%"
+# /usr/local/bin/disk-guard.sh  — run via host cron every hour
+USAGE=$(df --output=pcent /mnt/hdd | tail -1 | tr -dc '0-9')
+echo "$(date -Iseconds) HDD usage ${USAGE}%"
 if [ "$USAGE" -ge 90 ]; then
-  echo "WARNING: SSD at ${USAGE}% — tighten restic retention or investigate."
+  echo "WARNING: HDD at ${USAGE}% — tighten restic retention or investigate."
   # Hook in a notification: ntfy / Home Assistant webhook / email, etc.
 fi
 ```
@@ -406,19 +422,19 @@ Document these for the end user — the whole point of the system.
 
 ### 9.1 OneDrive gone / subscription cancelled
 
-The **live mirror** at `/mnt/ssd/onedrive-mirror` *is* the recovery copy. It is a plain directory tree of every file — just copy it off the SSD. No tool required to read it.
+The **live mirror** at `/mnt/hdd/onedrive-mirror` *is* the recovery copy. It is a plain directory tree of every file — just copy it off the HDD. No tool required to read it.
 
 ### 9.2 Recover a previous version of a file (GFS)
 
 ```bash
 # List snapshots
 docker run --rm -it --env-file backup.env \
-  -v /mnt/ssd/restic-repo:/repo restic/restic snapshots
+  -v /mnt/hdd/restic-repo:/repo restic/restic snapshots
 
 # Restore one path from a chosen snapshot into a scratch dir
 docker run --rm -it --env-file backup.env \
-  -v /mnt/ssd/restic-repo:/repo \
-  -v /mnt/ssd/restore-scratch:/restore \
+  -v /mnt/hdd/restic-repo:/repo \
+  -v /mnt/hdd/restore-scratch:/restore \
   restic/restic restore <SNAPSHOT_ID> \
     --include /data/onedrive-mirror/path/to/file.ext \
     --target /restore
@@ -427,7 +443,7 @@ docker run --rm -it --env-file backup.env \
 ### 9.3 Browse a snapshot interactively
 
 ```bash
-restic mount /mnt/restic-browse    # FUSE-mount all snapshots as a browsable tree
+restic mount /mnt/hdd/restic-browse    # FUSE-mount all snapshots as a browsable tree
 ```
 
 ---
@@ -449,8 +465,8 @@ Stage 1 (rclone mirror) is unchanged. This manual treats restic as primary; `rsn
 
 ## 11. Implementation Checklist
 
-- [ ] SSD formatted ext4, mounted at `/mnt/ssd` via `/etc/fstab` by UUID, auto-mounts on boot.
-- [ ] `rclone.conf` generated via browser OAuth, placed at `/mnt/ssd/config/rclone/`, mounted **read-write**.
+- [ ] HDD formatted ext4 (see Section 3.1), mounted at `/mnt/hdd` via `/etc/fstab` by UUID with `noatime,commit=60,nofail`, auto-mounts on boot.
+- [ ] `rclone.conf` generated via browser OAuth, placed at `/mnt/hdd/config/rclone/`, mounted **read-write**.
 - [ ] Stage 1 loop script in place; `copy` (not `sync`) confirmed.
 - [ ] restic repo initialized; `RESTIC_PASSWORD` stored safely **and** backed up separately.
 - [ ] Stage 2 loop script in place with GFS `forget --prune`.
@@ -460,7 +476,7 @@ Stage 1 (rclone mirror) is unchanged. This manual treats restic as primary; `rsn
 - [ ] Initial ~2 TB mirror completed (monitor logs; expect many hours).
 - [ ] First restic snapshot verified (`restic snapshots`).
 - [ ] `restic stats` checked after several weeks; retention tuned to keep `mirror + repo < ~3.5 TB`.
-- [ ] SSD-usage guard (Section 8) scheduled with notifications; thresholds at 85/90 %.
+- [ ] HDD-usage guard (Section 8) scheduled with notifications; thresholds at 85/90 %.
 - [ ] Periodic `restic check` scheduled.
 - [ ] Restore procedure (Section 9) tested at least once with a real file.
 
