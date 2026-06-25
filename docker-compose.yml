@@ -66,3 +66,46 @@ services:
       options:
         max-size: "10m"
         max-file: "5"
+
+  # ---------------------------------------------------------------------------
+  # Backrest — web UI for browsing restic snapshots and downloading files.
+  #
+  # After first start, open http://<pi-ip>:9898 and add the repository:
+  #   URI:      /repos/onedrive-nas
+  #   Password: (the RESTIC_PASSWORD value from your .env)
+  #
+  # IMPORTANT — in the Backrest repo settings, add this extra restic flag:
+  #   --no-lock
+  # This tells restic not to attempt writing lock files, which is required
+  # because the repo is mounted read-only (:ro) below. Browse and file-
+  # download operations (snapshots / ls / dump) are all safe without locks.
+  # Do NOT configure any backup schedules inside Backrest for this repo —
+  # the orchestrator service owns all write operations.
+  # ---------------------------------------------------------------------------
+  backrest:
+    image: garethgeorge/backrest:latest
+    container_name: backrest
+    restart: unless-stopped
+
+    environment:
+      - BACKREST_DATA=/config
+      - TZ=${TZ:-UTC}
+
+    volumes:
+      # Backrest's own config (stores repo config, schedules, UI settings).
+      - ./backrest-config:/config
+      # The restic repo — read-only: Backrest can browse and download files
+      # but cannot modify the repo or interfere with the orchestrator.
+      - ${DATA_DIR}/restic-repo:/repos/onedrive-nas:ro
+
+    ports:
+      - "9898:9898"
+
+    depends_on:
+      - onedrive-nas
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
