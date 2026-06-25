@@ -1,367 +1,145 @@
 # OneDrive → Raspberry Pi NAS Backup
 
-A dockerized backup appliance for a Raspberry Pi with an attached HDD. It
-continuously mirrors a **personal OneDrive** account to a local HDD, **keeps
-files that were deleted online**, and maintains **GFS (grandfather-father-son)
-version history** — all sized to fit a **2 TB HDD** backing up a **1 TB
-OneDrive**.
+Continuously mirrors a personal OneDrive to a local HDD, **keeps files deleted
+online**, maintains GFS version history, and exposes a web UI for browsing
+snapshots and downloading files. Sized for a 1 TB OneDrive on a 2 TB HDD.
 
-It is designed to run as one extra service alongside an existing Home
-Assistant / smart-home Docker Compose stack.
+```
+OneDrive ──► rclone copy (every 5 min) ──► /data/mirror (live mirror)
+                                                │
+                                     restic backup (daily) ──► /data/restic-repo
+                                                │
+                                     Backrest web UI :9898 (read-only viewer)
+```
+
+`rclone copy` (never `sync`) is what keeps online-deleted files — it only ever
+adds or updates locally, never removes. `restic` adds deduplicated GFS history
+on top. Both run in one container; Backrest is a second, read-only service.
 
 ---
 
-## Table of contents
+## Requirements
 
-1. [What it does](#what-it-does)
-2. [How it works](#how-it-works)
-3. [Storage budget (1 TB → 2 TB)](#storage-budget)
-4. [Prerequisites](#prerequisites)
-5. [Install & first run](#install--first-run)
-6. [Configuration reference](#configuration-reference)
-7. [Day-2 operations](#day-2-operations)
-8. [Restoring files](#restoring-files)
-9. [How the storage stays bounded](#how-the-storage-stays-bounded)
-10. [Troubleshooting](#troubleshooting)
-11. [Design notes & caveats](#design-notes--caveats)
-12. [Project layout](#project-layout)
-
----
-
-## What it does
-
-| Requirement | Behaviour |
-|---|---|
-| Mirror entire OneDrive locally | Full copy on the HDD, refreshed continuously |
-| Near-real-time sync | Polls every 5 minutes (configurable) |
-| **Never delete online-deleted files** | Uses `rclone copy` (not `sync`) — local deletions never happen |
-| Update on overwrite | Newest version of a still-existing file replaces the old one in the mirror |
-| Version history (GFS) | `restic` keeps daily/weekly/monthly snapshots, deduplicated |
-| Fits the HDD | Conservative retention + an automatic disk guard keep usage bounded |
-| Runs with home automation | A single Compose service; `restart: unless-stopped` |
-
-> **Use case:** this is a *disaster mirror* — protection for "OneDrive becomes
-> unavailable" or "I cancel my Microsoft subscription" — plus a modest version
-> history. It is not a substitute for the 3-2-1 rule on its own (it is one
-> copy on one device); see [caveats](#design-notes--caveats).
-
----
-
-## How it works
-
-Two cooperating stages run inside one container (`scripts/orchestrator.sh`):
-
-```
-                  ┌──────────────────────────────────────────────┐
-OneDrive (1 TB) ──┤ STAGE 1 — rclone copy  (every 5 min)          │
-  personal acct   │   → /data/mirror                              │
-                  │   Live mirror. copy, never sync, so files     │
-                  │   deleted online are KEPT locally forever.    │
-                  └───────────────────┬──────────────────────────┘
-                                      │ (reads the mirror)
-                                      ▼
-                  ┌──────────────────────────────────────────────┐
-                  │ STAGE 2 — restic backup + forget --prune      │
-                  │   → /data/restic-repo   (daily)               │
-                  │   Deduplicated, encrypted GFS version history.│
-                  └──────────────────────────────────────────────┘
-```
-
-**Why two tools?**
-
-- `rclone copy` is what guarantees online-deleted files are retained. `copy`
-  only ever *adds/updates* the destination; it never propagates deletions. (If
-  this were `sync`, deletions would mirror across — the opposite of what we
-  want.)
-- `restic` provides real version history with **content-addressed
-  deduplication**, so months of snapshots of a mostly-static dataset cost
-  roughly "unique data + churn", not "N × full size". Its `forget --prune`
-  implements GFS thinning in one command.
-
-A shared lock (`mkdir`-based mutex) ensures a heavy restic `prune` and an
-rclone run never collide on the Pi's USB/SSD bus.
-
----
-
-## Storage budget
-
-**Source: ~1 TB OneDrive. Target: 2 TB HDD.** Both the mirror and the version
-repo live on the same HDD:
-
-```
-2 TB HDD  (mounted at DATA_DIR, e.g. /mnt/hdd/onedrive-nas)
-├── mirror/        ~1 TB now; grows slowly as online-deleted files accumulate
-└── restic-repo/   deduplicated GFS history — the rest of the budget
-```
-
-The defaults (`KEEP_DAILY=7 KEEP_WEEKLY=4 KEEP_MONTHLY=6`, no yearly) are
-deliberately **conservative** so the repo stays comfortably under the remaining
-~1 TB. Target: keep the repo under **~600–800 GB** to leave headroom above the
-~1 TB mirror.
-
-The container also runs a **disk guard**: if `/data` usage reaches
-`DISK_USAGE_HALT_PCT` (default 92 %), it **skips** new snapshots to avoid filling
-the disk (a full disk breaks both rclone writes and restic prune). At
-`DISK_USAGE_WARN_PCT` (85 %) it logs a warning to tighten retention.
-
-See [How the storage stays bounded](#how-the-storage-stays-bounded) for the
-tuning procedure.
-
----
-
-## Prerequisites
-
-- Raspberry Pi 4/5 (4 GB+ RAM recommended; see [caveats](#design-notes--caveats)
-  for low-memory notes). 64-bit Raspberry Pi OS.
-- Docker + Docker Compose plugin installed.
-- An HDD attached over USB3, formatted **ext4**, mounted at a stable path via
-  `/etc/fstab` by `UUID=`. ext4 is required: restic needs POSIX
-  permissions/ownership, and a 24/7 write workload needs a journaled filesystem.
-  (exFAT/NTFS are **not** suitable here — see the FAQ.)
-- A machine with a web browser available **once**, for OneDrive OAuth.
-
-### Formatting the HDD (one-time)
-
-Run these on the Pi. Replace `/dev/sdb` with your actual device from `blkid`.
-**This erases all data on the disk.**
-
-```bash
-sudo blkid                       # identify the disk (e.g. /dev/sdb)
-sudo umount /dev/sdb1 2>/dev/null
-sudo wipefs -a /dev/sdb          # clear any existing partition table / signatures
-sudo parted /dev/sdb --script mklabel gpt mkpart primary ext4 0% 100%
-sudo mkfs.ext4 -L onedrive-nas -m 1 /dev/sdb1
-# -L: volume label (optional, makes blkid output readable)
-# -m 1: reserve only 1 % for root (default 5 % wastes ~100 GB on a 2 TB disk)
-```
-
-### Mounting the HDD
-
-```bash
-sudo blkid /dev/sdb1             # copy the UUID from the output
-echo 'UUID=<your-uuid>  /mnt/hdd  ext4  defaults,noatime,commit=60,nofail  0  2' \
-  | sudo tee -a /etc/fstab
-# noatime    — skip access-time writes on every read (reduces HDD churn)
-# commit=60  — flush the journal every 60 s instead of 5 s (fewer seeks)
-# nofail     — boot normally even if the drive is absent (see caveat below)
-sudo mkdir -p /mnt/hdd/onedrive-nas
-sudo mount -a
-```
-
-> **`nofail` caveat:** if the HDD is absent at boot Docker will start the
-> container against an empty directory on the SD card. The orchestrator detects
-> this (it compares the device IDs of `/data` and `/`) and exits with a fatal
-> error rather than writing anything to the SD card.
+- Raspberry Pi (1 GB RAM min; 4 GB+ recommended). 64-bit Raspberry Pi OS.
+- Docker + Compose. Add your user to the `docker` group and **reboot**.
+- HDD formatted **ext4**, mounted at a stable path via `/etc/fstab` using
+  `UUID=` (not PARTUUID). Example fstab line:
+  ```
+  UUID=xxxx  /mnt/hdd  ext4  defaults,noatime,nofail  0  2
+  ```
+- A browser machine available once for OneDrive OAuth.
 
 ---
 
 ## Install & first run
 
 ```bash
-# 1. Get the project onto the Pi
-git clone <your-repo> onedrive-nas && cd onedrive-nas
-#    (or copy this directory over)
+git clone <this-repo> onedrive-nas && cd onedrive-nas
 
-# 2. Configure
 cp .env.example .env
-nano .env
-#    REQUIRED edits:
-#      DATA_DIR=/mnt/hdd/onedrive-nas        # your HDD path
-#      RESTIC_PASSWORD=<long random phrase>  # SAVE THIS SEPARATELY!
+nano .env          # set DATA_DIR and RESTIC_PASSWORD (save the password elsewhere!)
 
-# 3. Build the image (multi-arch; builds natively on the Pi)
-docker compose build           # or: make build
+docker compose build
 
-# 4. One-time OneDrive authorization
-#    Run on a machine WITH a browser. Creates config/rclone/rclone.conf.
-./scripts/setup-rclone.sh      # or: make setup
-#    In the wizard:
-#      name:        onedrive            (exactly)
-#      storage:     Microsoft OneDrive
-#      client id/secret: blank
-#      region:      Microsoft Cloud Global
-#      account:     OneDrive Personal
-#    Copy config/rclone/rclone.conf to the Pi if you ran this elsewhere.
+./scripts/setup-rclone.sh   # one-time OneDrive OAuth — run on a machine with a browser
+                             # remote name must be exactly: onedrive
 
-# 5. Start it
-docker compose up -d           # or: make up
-docker compose logs -f         # watch the initial sync (HOURS for ~1 TB)
+docker compose up -d
+docker compose logs -f      # first mirror (~1 TB) takes many hours
 ```
-
-The first mirror run downloads ~1 TB and will take **many hours** depending on
-your connection and OneDrive throttling. The first restic snapshot runs after
-`SNAPSHOT_INTERVAL` (default 24 h), by which point the mirror is populated.
 
 ---
 
-## Configuration reference
+## Configuration
 
-All settings live in `.env` (copied from `.env.example`). Key ones:
+All settings in `.env`. The most important:
 
-| Variable | Default | Meaning |
+| Variable | Default | Notes |
 |---|---|---|
-| `DATA_DIR` | `/mnt/hdd/onedrive-nas` | **Host** HDD path holding `mirror/` + `restic-repo/` |
-| `RESTIC_PASSWORD` | — | Encrypts the repo. **Unrecoverable if lost.** |
-| `RCLONE_REMOTE` | `onedrive:` | rclone remote; append a subpath to mirror part of OneDrive |
-| `MIRROR_INTERVAL` | `300` | Seconds between mirror runs (5 min) |
-| `SNAPSHOT_INTERVAL` | `86400` | Seconds between restic snapshots (24 h) |
-| `KEEP_DAILY/WEEKLY/MONTHLY/YEARLY` | `7/4/6/0` | GFS retention (primary storage control) |
-| `RCLONE_TRANSFERS` / `RCLONE_CHECKERS` | `1` / `2` | Concurrency (1 transfer avoids HDD seek-thrash) |
-| `RCLONE_TPSLIMIT` | `10` | Transactions/sec cap (OneDrive throttling) |
-| `DISK_USAGE_WARN_PCT` / `DISK_USAGE_HALT_PCT` | `85` / `92` | Disk-guard thresholds |
-| `DISABLE_SNAPSHOTS` | `0` | Set `1` to run the mirror only (stage 1) |
-| `MEM_LIMIT` / `CPU_LIMIT` | `512m` / `1.5` | Container resource caps |
-| `TZ` | `Europe/Berlin` | Timezone for log timestamps & GFS day boundaries |
+| `DATA_DIR` | `/mnt/hdd/onedrive-nas` | Host path for `mirror/` + `restic-repo/` |
+| `RESTIC_PASSWORD` | — | Encrypts version history. **Unrecoverable if lost.** |
+| `KEEP_DAILY/WEEKLY/MONTHLY` | `7/4/6` | Primary lever for staying under 2 TB |
+| `PRUNE_EVERY_N` | `7` | Run `forget --prune` every N snapshots (weekly) |
+| `MIRROR_INTERVAL` | `300` | Seconds between rclone runs |
+| `DISABLE_SNAPSHOTS` | `0` | Set `1` for mirror-only (no restic) |
+| `MEM_LIMIT` / `MEM_SWAP_LIMIT` | `512m` / `2048m` | Tune for your Pi's RAM |
+| `DISK_USAGE_HALT_PCT` | `92` | Skip snapshots above this % to protect the disk |
 
 ---
 
-## Day-2 operations
+## Backrest web UI
 
-A `Makefile` and `scripts/admin.sh` wrap the common tasks:
+Open `http://<pi-ip>:9898`. On first run:
 
-```bash
-make logs                 # follow logs
-make ps                   # service status
-make snapshots            # list restic snapshots
-make stats                # repository size / dedup stats
-make check                # restic integrity check
-make unlock               # clear a stale restic lock
+1. Create a web UI admin account.
+2. Add a repository:
+   - **URI:** `/repos/onedrive-nas`
+   - **Password:** your `RESTIC_PASSWORD`
+   - **Extra restic flags:** `--no-lock`  ← required; the repo is mounted read-only
+3. Leave all schedule fields **empty** — the orchestrator owns all writes.
+4. Click **"Index Snapshots"** to import existing snapshots.
 
-# raw restic, anything:
-./scripts/admin.sh raw -- snapshots --compact
-```
-
-Run `make stats` after a few weeks to see real repo growth, then tune retention
-(next section).
+From the UI you can browse any snapshot and download individual files.
 
 ---
 
 ## Restoring files
 
-### Scenario A — OneDrive gone / subscription cancelled
+**Recover the whole OneDrive** (e.g. subscription cancelled): the mirror is a
+plain directory tree — just copy it off the HDD. No tooling needed.
 
-The live mirror **is** your data. It's a plain directory tree on the HDD:
-
-```bash
-ls /mnt/hdd/onedrive-nas/mirror/
-cp -a /mnt/hdd/onedrive-nas/mirror/ /wherever/you/want/
-```
-
-No tooling required.
-
-### Scenario B — recover an earlier version of a file
+**Recover an older version of a file**: use the Backrest UI (easiest), or:
 
 ```bash
-make snapshots                                   # find the snapshot ID + date
-./scripts/admin.sh restore <SNAPSHOT_ID> "Documents/2024/report.docx"
-#   -> restored under ./restore/ on the host
-```
-
-Or browse all snapshots as a mounted filesystem:
-
-```bash
-./scripts/admin.sh mount      # needs FUSE; Ctrl-C to unmount
+make snapshots                                          # find snapshot ID
+./scripts/admin.sh restore <SNAPSHOT_ID> "path/to/file"
+# result lands in ./restore/
 ```
 
 ---
 
-## How the storage stays bounded
+## Day-2 operations
 
-Because restic **deduplicates**, total repo size ≈ *unique data ever captured +
-churn between snapshots*, **not** (number of snapshots × dataset size). A
-snapshot where nothing changed costs only metadata.
+```bash
+make logs        # follow container logs
+make stats       # restic repo size + dedup stats  (run after a few weeks)
+make snapshots   # list all snapshots
+make check       # restic integrity check
+make unlock      # clear a stale restic lock
+```
 
-**Tuning procedure:**
-
-1. Run for 2–4 weeks. Then `make stats`.
-2. Compute `mirror + repo` against the 2 TB HDD (`df -h /mnt/hdd`).
-3. **Headroom?** Loosen retention for deeper history: raise `KEEP_MONTHLY`
-   toward 12, or set `KEEP_YEARLY=1`–`2`. Restart: `docker compose up -d`.
-4. **Tight (approaching ~1.6–1.7 TB)?** Tighten: lower `KEEP_MONTHLY`, drop
-   `KEEP_WEEKLY` to 2. It is far easier to add history than to recover from a
-   full disk.
-
-The disk guard is a backstop, not the primary control — retention is. If you
-ever see "DISK GUARD … SKIPPING snapshot" in the logs, tighten retention and run
-a manual `./scripts/admin.sh raw -- forget … --prune`.
+After a few weeks, run `make stats`, check `df -h /mnt/hdd`, and tune `KEEP_*`
+in `.env` to keep `mirror + repo` comfortably under 2 TB.
 
 ---
 
-## Troubleshooting
+## Caveats
 
-**Initial sync seems stuck / very slow.** ~1 TB over USB3 + OneDrive throttling
-legitimately takes many hours. Watch `docker compose logs -f`; rclone logs
-per-file progress at `INFO`.
-
-**`429 Too Many Requests` in logs.** OneDrive throttling. Lower
-`RCLONE_TRANSFERS`/`RCLONE_CHECKERS` and/or `RCLONE_TPSLIMIT`.
-
-**Auth fails after ~90 days.** OneDrive refresh tokens expire after 90 days of
-non-use; continuous operation keeps them alive, but if the container was off for
-months, re-run `./scripts/setup-rclone.sh` (or
-`./scripts/admin.sh raw -- ...` won't help here — it's an rclone reconnect:
-`docker run --rm -it -v "$PWD/config/rclone:/config/rclone" --entrypoint rclone onedrive-nas:latest config reconnect onedrive:`).
-
-**`config/rclone` must stay writable.** rclone writes refreshed tokens back to
-`rclone.conf`. The compose mount is intentionally read-write — don't make it
-`:ro`.
-
-**restic complains about a lock.** A previous run was interrupted. `make unlock`.
-
-**Disk guard keeps skipping snapshots.** You're near capacity. Tighten retention
-(see above) and prune.
-
----
-
-## Design notes & caveats
-
-- **"Instant" isn't literally possible.** OneDrive's API doesn't push change
-  events to rclone, so a 5-minute poll is the practical near-real-time approach.
-  Lower `MIRROR_INTERVAL` for tighter latency at the cost of more API calls.
-- **One device = one copy.** This appliance is a robust local mirror with
-  history, but it lives on a single HDD in one location. For true resilience,
-  follow 3-2-1: add an offsite copy (e.g. a second restic repo target). The
-  same restic repo design makes that straightforward later.
-- **Overwrites lose the *online* version, not your history.** When a file
-  changes online, the mirror takes the newest version — but the previous
-  version is preserved in the restic snapshots (within your retention window).
-- **Low-memory Pis (≤2 GB):** restic `prune` is memory-hungry over ~1 TB.
-  Options: run prune less often (raise `PRUNE_EVERY_N`); switch stage 2 to
-  `rsnapshot` (hardlink snapshots, far lighter, but no dedup/encryption).
-  Avoid relying on swap on an HDD — paging into a spinning disk during prune
-  can stall the container for hours.
-- **Filesystem must be ext4.** exFAT/NTFS lack journaling and POSIX
-  permissions; exFAT in particular risks corruption under continuous writes and
-  breaks restic's permission model. Use ext4 on the HDD and, if you need to read
-  the drive on Windows/macOS occasionally, use a third-party ext4 driver there
-  rather than reformatting.
-- **Back up the `RESTIC_PASSWORD` and ideally `rclone.conf`** somewhere off the
-  SSD. The password is the only key to the encrypted history.
+- **Live mirror is unencrypted.** Files in `mirror/` are plain files — anyone
+  with the HDD can read them. The restic repo is always encrypted; `RESTIC_PASSWORD`
+  is mandatory and there is no opt-out.
+- **1 GB Pi:** restic `prune` is memory-hungry. The defaults (`PRUNE_EVERY_N=7`,
+  `RESTIC_PACK_SIZE=128`) reduce peak RAM. Avoid HDD swap — paging during prune
+  on a spinning disk stalls for hours. If it still OOMs, set `DISABLE_SNAPSHOTS=1`.
+- **Not a 3-2-1 backup.** This is one copy on one device. Add an offsite target
+  for true resilience.
+- **`config/rclone/` must stay writable.** rclone writes refreshed OAuth tokens
+  back to `rclone.conf` — do not mount it `:ro`.
 
 ---
 
 ## Project layout
 
 ```
-onedrive-nas/
-├── Dockerfile               # rclone base + restic binary + bash runtime
-├── docker-compose.yml       # single service: onedrive-nas
+├── Dockerfile
+├── docker-compose.yml       # onedrive-nas + backrest services
 ├── .env.example             # copy to .env and edit
-├── .gitignore / .dockerignore
-├── Makefile                 # convenience targets (make help)
+├── Makefile                 # make help for all targets
 ├── scripts/
-│   ├── orchestrator.sh      # entrypoint: runs both loops + lock + disk guard
-│   ├── setup-rclone.sh      # one-time OneDrive OAuth helper
-│   └── admin.sh             # restic snapshots/stats/check/restore/mount
-├── config/
-│   └── rclone/              # rclone.conf lands here (RW; gitignored)
-└── restore/                 # scratch space for restores (gitignored)
+│   ├── orchestrator.sh      # main loop: rclone + restic + lock + disk guard
+│   ├── setup-rclone.sh      # one-time OneDrive auth
+│   └── admin.sh             # restic admin tasks (snapshots/restore/check/…)
+├── config/rclone/           # rclone.conf (gitignored)
+├── backrest-config/         # Backrest state (gitignored)
+└── restore/                 # restore scratch space (gitignored)
 ```
-
----
-
-### One-line summary for the operator
-
-Edit `.env` (set `DATA_DIR` + `RESTIC_PASSWORD`), `make build`, `make setup`
-(OneDrive login), `make up`. Watch `make logs`. After a few weeks, `make stats`
-and tune `KEEP_*` to taste within the 2 TB budget.

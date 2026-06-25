@@ -4,6 +4,9 @@
 # rclone config contains OAuth tokens
 config/rclone/rclone.conf
 
+# Backrest stores the restic repo password in its config
+backrest-config/
+
 # Local restore scratch space
 restore/
 
