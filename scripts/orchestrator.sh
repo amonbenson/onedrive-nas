@@ -82,11 +82,15 @@ mirror_loop() {
   log mirror "loop started; remote=${RCLONE_REMOTE} dest=${MIRROR_DIR} interval=${MIRROR_INTERVAL}s"
   while true; do
     if acquire_lock "mirror" 1800; then
-      log mirror "starting rclone copy"
-      # copy (NOT sync): never deletes locally files removed online.
+      log mirror "starting rclone sync"
+      # sync: local mirror becomes an exact replica of OneDrive, including deletions.
+      # The source→destination direction means rclone never writes to OneDrive.
+      # --delete-after: finish all downloads before removing anything locally,
+      # so a partial run never leaves the mirror in a half-deleted state.
       # shellcheck disable=SC2086
-      rclone copy "${RCLONE_REMOTE}" "${MIRROR_DIR}" \
+      rclone sync "${RCLONE_REMOTE}" "${MIRROR_DIR}" \
         --create-empty-src-dirs \
+        --delete-after \
         --transfers "${RCLONE_TRANSFERS}" \
         --checkers "${RCLONE_CHECKERS}" \
         --tpslimit "${RCLONE_TPSLIMIT}" \
@@ -94,9 +98,9 @@ mirror_loop() {
         ${RCLONE_EXTRA_FLAGS}
       rc=$?
       if [ $rc -eq 0 ]; then
-        log mirror "rclone copy completed cleanly"
+        log mirror "rclone sync completed cleanly"
       else
-        log mirror "rclone copy exited rc=${rc} (will retry next cycle)"
+        log mirror "rclone sync exited rc=${rc} (will retry next cycle)"
       fi
       release_lock
     fi

@@ -1,20 +1,23 @@
 # OneDrive → Raspberry Pi NAS Backup
 
-Continuously mirrors a personal OneDrive to a local HDD, **keeps files deleted
-online**, maintains GFS version history, and exposes a web UI for browsing
-snapshots and downloading files. Sized for a 1 TB OneDrive on a 2 TB HDD.
+Continuously mirrors a personal OneDrive to a local HDD as an **exact replica**
+(including deletions), maintains GFS version history so older and deleted files
+can be recovered, and exposes a web UI for browsing snapshots and downloading
+files. Sized for a 1 TB OneDrive on a 2 TB HDD.
 
 ```
-OneDrive ──► rclone copy (every 5 min) ──► /data/mirror (live mirror)
+OneDrive ──► rclone sync (every 5 min) ──► /data/mirror (exact replica)
                                                 │
                                      restic backup (daily) ──► /data/restic-repo
                                                 │
                                      Backrest web UI :9898 (read-only viewer)
 ```
 
-`rclone copy` (never `sync`) is what keeps online-deleted files — it only ever
-adds or updates locally, never removes. `restic` adds deduplicated GFS history
-on top. Both run in one container; Backrest is a second, read-only service.
+`rclone sync` makes the local mirror an exact replica of OneDrive, including
+deletions. The sync direction (OneDrive → local) means rclone never writes to
+OneDrive. `restic` snapshots the mirror daily, so files deleted online can still
+be recovered from history. Both run in one container; Backrest is a second,
+read-only service.
 
 ---
 
@@ -85,8 +88,9 @@ From the UI you can browse any snapshot and download individual files.
 
 ## Restoring files
 
-**Recover the whole OneDrive** (e.g. subscription cancelled): the mirror is a
-plain directory tree — just copy it off the HDD. No tooling needed.
+**Recover the whole OneDrive** (e.g. subscription cancelled): pick the most
+recent restic snapshot and restore it, or copy the mirror directly if it hasn't
+diverged yet. The mirror is a plain directory tree — no tooling needed to read it.
 
 **Recover an older version of a file**: use the Backrest UI (easiest), or:
 
