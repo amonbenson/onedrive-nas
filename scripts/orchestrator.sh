@@ -95,6 +95,7 @@ mirror_loop() {
         --checkers "${RCLONE_CHECKERS}" \
         --tpslimit "${RCLONE_TPSLIMIT}" \
         --log-level "${LOG_LEVEL}" \
+        --ignore-size \
         ${RCLONE_EXTRA_FLAGS}
       rc=$?
       if [ $rc -eq 0 ]; then
