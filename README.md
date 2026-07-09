@@ -8,16 +8,19 @@ files. Sized for a 1 TB OneDrive on a 2 TB HDD.
 ```
 OneDrive ──► rclone sync (every 5 min) ──► /data/mirror (exact replica)
                                                 │
-                                     restic backup (daily) ──► /data/restic-repo
+                                     Backrest (own cron schedule)
                                                 │
-                                     Backrest web UI :9898 (read-only viewer)
+                                       restic backup ──► /data/restic-repo
+                                                │
+                                  Backrest web UI :9898 (browse/restore/prune)
 ```
 
 `rclone sync` makes the local mirror an exact replica of OneDrive, including
 deletions. The sync direction (OneDrive → local) means rclone never writes to
-OneDrive. `restic` snapshots the mirror daily, so files deleted online can still
-be recovered from history. Both run in one container; Backrest is a second,
-read-only service.
+OneDrive. Backrest — a separate container — owns all restic backup, retention,
+and prune scheduling against that same mirror directory, so a slow or stuck
+OneDrive sync can never block a scheduled snapshot (the two containers share
+no lock and run fully independently).
 
 ---
 
@@ -51,6 +54,10 @@ docker compose up -d
 docker compose logs -f      # first mirror (~1 TB) takes many hours
 ```
 
+Then configure Backrest (see below) — this is now the only thing that
+produces version history; the mirror alone does not retain deleted/changed
+files.
+
 ---
 
 ## Configuration
@@ -60,13 +67,14 @@ All settings in `.env`. The most important:
 | Variable | Default | Notes |
 |---|---|---|
 | `DATA_DIR` | `/mnt/hdd/onedrive-nas` | Host path for `mirror/` + `restic-repo/` |
-| `RESTIC_PASSWORD` | — | Encrypts version history. **Unrecoverable if lost.** |
-| `KEEP_DAILY/WEEKLY/MONTHLY` | `7/4/6` | Primary lever for staying under 2 TB |
-| `PRUNE_EVERY_N` | `7` | Run `forget --prune` every N snapshots (weekly) |
+| `RESTIC_PASSWORD` | — | Paste into the Backrest UI when adding the repository. **Unrecoverable if lost.** |
 | `MIRROR_INTERVAL` | `300` | Seconds between rclone runs |
-| `DISABLE_SNAPSHOTS` | `0` | Set `1` for mirror-only (no restic) |
-| `MEM_LIMIT` / `MEM_SWAP_LIMIT` | `512m` / `2048m` | Tune for your Pi's RAM |
-| `DISK_USAGE_HALT_PCT` | `92` | Skip snapshots above this % to protect the disk |
+| `DISK_USAGE_WARN_PCT` | `85` | Mirror container logs a warning above this disk-usage % |
+| `MEM_LIMIT` / `MEM_SWAP_LIMIT` / `CPU_LIMIT` | `256m` / `1024m` / `1.0` | Resource caps for the mirror container |
+| `BACKREST_MEM_LIMIT` / `BACKREST_MEM_SWAP_LIMIT` / `BACKREST_CPU_LIMIT` | `320m` / `1280m` / `1.0` | Resource caps for the backrest container |
+
+Backup schedule and GFS retention (daily/weekly/monthly/yearly) are no longer
+`.env` variables — configure them in the Backrest UI (see below).
 
 ---
 
@@ -77,54 +85,72 @@ Open `http://<pi-ip>:9898`. On first run:
 1. Create a web UI admin account.
 2. Add a repository:
    - **URI:** `/repos/onedrive-nas`
-   - **Password:** your `RESTIC_PASSWORD`
-   - **Extra restic flags:** `--no-lock`  ← required; the repo is mounted read-only
-3. Leave all schedule fields **empty** — the orchestrator owns all writes.
-4. Click **"Index Snapshots"** to import existing snapshots.
+   - **Password:** your `.env`'s `RESTIC_PASSWORD`
+   - No extra flags needed — the repo is mounted read-write, so Backrest can
+     lock, write, and prune it directly.
+3. Add a plan:
+   - **Source path:** `/data/mirror`
+   - **Backup schedule:** a cron expression, e.g. `0 3 * * *` for daily at
+     03:00.
+   - **Retention policy:** time-based, e.g. keep-daily 7 / keep-weekly 4 /
+     keep-monthly 6 — tune to stay within the storage budget (see
+     `.env.example`).
+4. On the repository's own settings, set a separate **prune/check**
+   maintenance schedule (recommend a fixed off-peak hour, e.g. weekly at
+   `0 4 * * 0` — prune is the heaviest restic operation; see Caveats below).
+5. Click **"Index Snapshots"** if you have pre-existing snapshots to import.
 
-From the UI you can browse any snapshot and download individual files.
+From the UI you can browse any snapshot, restore individual files or a whole
+snapshot to a target path, view repository stats, and run check/prune on
+demand.
 
 ---
 
 ## Restoring files
 
 **Recover the whole OneDrive** (e.g. subscription cancelled): pick the most
-recent restic snapshot and restore it, or copy the mirror directly if it hasn't
-diverged yet. The mirror is a plain directory tree — no tooling needed to read it.
+recent restic snapshot and restore it via the Backrest UI, or copy the mirror
+directly if it hasn't diverged yet. The mirror is a plain directory tree — no
+tooling needed to read it.
 
-**Recover an older version of a file**: use the Backrest UI (easiest), or:
-
-```bash
-make snapshots                                          # find snapshot ID
-./scripts/admin.sh restore <SNAPSHOT_ID> "path/to/file"
-# result lands in ./restore/
-```
+**Recover an older version of a file**: open the snapshot in the Backrest UI
+and restore or download the file directly.
 
 ---
 
 ## Day-2 operations
 
 ```bash
-make logs        # follow container logs
-make stats       # restic repo size + dedup stats  (run after a few weeks)
-make snapshots   # list all snapshots
-make check       # restic integrity check
-make unlock      # clear a stale restic lock
+make logs        # follow mirror container logs
+make ui          # print the Backrest URL
 ```
 
-After a few weeks, run `make stats`, check `df -h /mnt/hdd`, and tune `KEEP_*`
-in `.env` to keep `mirror + repo` comfortably under 2 TB.
+Everything else — repository stats, snapshot listing, integrity checks, lock
+management, retention tuning — lives in the Backrest UI. After a few weeks,
+check repo size there, check `df -h /mnt/hdd`, and tune retention in the
+Backrest plan/repo settings to keep `mirror + repo` comfortably under 2 TB.
 
 ---
 
 ## Caveats
 
+- **No cross-container write coordination.** The mirror's `rclone sync` and
+  Backrest's restic operations run in separate containers with no shared lock,
+  so they can now run concurrently — a change from the original single-
+  container design. Mitigated by giving each container its own `mem_limit`/
+  `cpus` cap (see `.env.example`), so a worst-case overlap OOM-kills only one
+  container (auto-restarted by `restart: unless-stopped`), not the whole Pi;
+  further mitigated by scheduling Backrest's prune at a fixed off-peak hour.
+  If you observe real contention on your hardware, consider lowering
+  `BACKREST_MEM_LIMIT`'s companion cap or moving prune to a quieter time.
 - **Live mirror is unencrypted.** Files in `mirror/` are plain files — anyone
   with the HDD can read them. The restic repo is always encrypted; `RESTIC_PASSWORD`
   is mandatory and there is no opt-out.
-- **1 GB Pi:** restic `prune` is memory-hungry. The defaults (`PRUNE_EVERY_N=7`,
-  `RESTIC_PACK_SIZE=128`) reduce peak RAM. Avoid HDD swap — paging during prune
-  on a spinning disk stalls for hours. If it still OOMs, set `DISABLE_SNAPSHOTS=1`.
+- **1 GB Pi:** restic `prune` is memory-hungry — that's why it now runs in its
+  own capped container (`BACKREST_MEM_LIMIT`) separate from the mirror. Avoid
+  HDD swap — paging during prune on a spinning disk stalls for hours. If prune
+  still OOMs, raise `BACKREST_MEM_LIMIT` if the Pi has headroom, or move it to
+  a less frequent/quieter schedule in the Backrest UI.
 - **Not a 3-2-1 backup.** This is one copy on one device. Add an offsite target
   for true resilience.
 - **`config/rclone/` must stay writable.** rclone writes refreshed OAuth tokens
@@ -136,13 +162,12 @@ in `.env` to keep `mirror + repo` comfortably under 2 TB.
 
 ```
 ├── Dockerfile
-├── docker-compose.yml       # onedrive-nas + backrest services
+├── docker-compose.yml       # onedrive-nas (mirror) + backrest services
 ├── .env.example             # copy to .env and edit
 ├── Makefile                 # make help for all targets
 ├── scripts/
-│   ├── orchestrator.sh      # main loop: rclone + restic + lock + disk guard
-│   ├── setup-rclone.sh      # one-time OneDrive auth
-│   └── admin.sh             # restic admin tasks (snapshots/restore/check/…)
+│   ├── orchestrator.sh      # main loop: rclone mirror + mount guard
+│   └── setup-rclone.sh      # one-time OneDrive auth
 ├── config/rclone/           # rclone.conf (gitignored)
 ├── backrest-config/         # Backrest state (gitignored)
 └── restore/                 # restore scratch space (gitignored)

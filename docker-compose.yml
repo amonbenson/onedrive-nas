@@ -1,8 +1,11 @@
 # OneDrive NAS backup — Docker Compose
 #
-# A single service runs both the rclone mirror loop and the restic snapshot
-# loop (see scripts/orchestrator.sh). Add this service to your existing
-# home-automation compose project, or run it standalone from this directory.
+# Two fully decoupled services:
+#   - onedrive-nas: runs only the rclone mirror loop (scripts/orchestrator.sh).
+#   - backrest: owns ALL restic operations — backup, retention, and prune —
+#     scheduled entirely through its own UI/cron. There is no shared lock or
+#     in-process coordination between the two; see README "Caveats" for the
+#     concurrency tradeoff and how it's mitigated (per-service resource caps).
 #
 # Quick start:
 #   1. cp .env.example .env   &&   edit .env  (set RESTIC_PASSWORD, DATA_DIR)
@@ -10,6 +13,8 @@
 #   3. ./scripts/setup-rclone.sh         (one-time OneDrive auth)
 #   4. docker compose up -d
 #   5. docker compose logs -f
+#   6. Configure Backrest (repo + plan + schedule) per the README — this is
+#      the only thing that produces version history now.
 
 services:
   onedrive-nas:
@@ -25,10 +30,9 @@ services:
       - .env
 
     environment:
-      # Paths INSIDE the container. Do not usually need changing — the host
+      # Path INSIDE the container. Do not usually need changing — the host
       # side is mapped below via DATA_DIR.
       - MIRROR_DIR=/data/mirror
-      - RESTIC_REPOSITORY=/data/restic-repo
       - TZ=${TZ:-UTC}
 
     volumes:
@@ -36,22 +40,20 @@ services:
       # tokens are written back here. Losing write access => sync stops.
       - ./config/rclone:/config/rclone
 
-      # The HDD. DATA_DIR on the host holds both the mirror and the restic repo.
+      # The HDD. DATA_DIR on the host holds both the mirror and the restic
+      # repo (the repo subdir is unused by this container — backrest owns it).
       # e.g. DATA_DIR=/mnt/hdd/onedrive-nas
       - ${DATA_DIR}:/data
 
     # rclone reads config from /config/rclone/rclone.conf by default in this
     # image; RCLONE_CONFIG points there explicitly to be safe.
-    # restic reads RESTIC_REPOSITORY + RESTIC_PASSWORD from env_file.
 
-    # Resource caps tuned for a 1 GB Pi (~600 MB usable after OS + Docker).
-    # mem_limit:    hard RAM ceiling for the container.
-    # memswap_limit: RAM + swap total. WARNING: swap on a spinning HDD is very
-    #                slow; restic prune paging into HDD swap can stall for hours.
-    #                Prefer a Pi with 4 GB+ RAM over relying on HDD swap.
-    mem_limit: ${MEM_LIMIT:-512m}
-    memswap_limit: ${MEM_SWAP_LIMIT:-2048m}
-    cpus: ${CPU_LIMIT:-1.5}
+    # Resource caps tuned for a 1 GB Pi. This container only runs rclone now
+    # (no more restic prune in-process), so it needs much less headroom than
+    # before — the rest of the RAM budget goes to the backrest service.
+    mem_limit: ${MEM_LIMIT:-256m}
+    memswap_limit: ${MEM_SWAP_LIMIT:-1024m}
+    cpus: ${CPU_LIMIT:-1.0}
 
     healthcheck:
       # Healthy if the mirror directory exists and the process is alive.
@@ -68,38 +70,55 @@ services:
         max-file: "5"
 
   # ---------------------------------------------------------------------------
-  # Backrest — web UI for browsing restic snapshots and downloading files.
+  # Backrest — owns ALL restic operations: backup, retention, and prune, on
+  # its own cron schedule (configured once through the web UI, persisted to
+  # backrest-config/config.json). It no longer just browses read-only.
   #
-  # After first start, open http://<pi-ip>:9898 and add the repository:
-  #   URI:      /repos/onedrive-nas
-  #   Password: (the RESTIC_PASSWORD value from your .env)
-  #
-  # IMPORTANT — in the Backrest repo settings, add this extra restic flag:
-  #   --no-lock
-  # This tells restic not to attempt writing lock files, which is required
-  # because the repo is mounted read-only (:ro) below. Browse and file-
-  # download operations (snapshots / ls / dump) are all safe without locks.
-  # Do NOT configure any backup schedules inside Backrest for this repo —
-  # the orchestrator service owns all write operations.
+  # After first start, open http://<pi-ip>:9898 and:
+  #   1. Create a web UI admin account.
+  #   2. Add a repository — URI: /repos/onedrive-nas, Password: RESTIC_PASSWORD
+  #      from .env. No extra flags needed; the repo is now mounted read-write.
+  #   3. Add a plan — source path /data/mirror, a cron backup schedule, and a
+  #      retention policy.
+  #   4. On the repository, set a separate prune/check maintenance schedule
+  #      (recommend a fixed off-peak hour — prune is the heaviest restic op).
+  # See README for the full walkthrough.
   # ---------------------------------------------------------------------------
   backrest:
     image: garethgeorge/backrest:latest
     container_name: backrest
     restart: unless-stopped
 
+    # Gives access to RESTIC_PASSWORD as a container env var, purely as a
+    # copy-paste convenience during the one-time UI repo setup (Backrest does
+    # not read it automatically into the UI's password field).
+    env_file:
+      - .env
+
     environment:
       - BACKREST_DATA=/config
       - TZ=${TZ:-UTC}
 
     volumes:
-      # Backrest's own config (stores repo config, schedules, UI settings).
+      # Backrest's own config (stores repo config, schedules, UI settings,
+      # and the repo password once entered in the UI).
       - ./backrest-config:/config
-      # The restic repo — read-only: Backrest can browse and download files
-      # but cannot modify the repo or interfere with the orchestrator.
-      - ${DATA_DIR}/restic-repo:/repos/onedrive-nas:ro
+      # The restic repo — read-write: Backrest now performs backup/forget/prune.
+      - ${DATA_DIR}/restic-repo:/repos/onedrive-nas
+      # The live mirror — this is the backup source. Read-only: Backrest only
+      # ever needs to read it.
+      - ${DATA_DIR}/mirror:/data/mirror:ro
 
     ports:
       - "9898:9898"
+
+    # Concurrency mitigation: with no shared lock between this container and
+    # onedrive-nas, an rclone sync and a restic backup/prune can now overlap.
+    # Capping this container's RAM means a worst-case overlap OOM-kills only
+    # backrest (auto-recovered by restart: unless-stopped), not the whole Pi.
+    mem_limit: ${BACKREST_MEM_LIMIT:-320m}
+    memswap_limit: ${BACKREST_MEM_SWAP_LIMIT:-1280m}
+    cpus: ${BACKREST_CPU_LIMIT:-1.0}
 
     depends_on:
       - onedrive-nas

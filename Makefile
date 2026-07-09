@@ -1,6 +1,6 @@
 # Convenience targets. Run `make help` for the list.
 
-.PHONY: help build setup up down logs ps stats snapshots check restore unlock shell
+.PHONY: help build setup up down logs ps shell ui
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -24,20 +24,8 @@ logs: ## Follow logs
 ps: ## Show service status
 	docker compose ps
 
-stats: ## restic repository statistics
-	./scripts/admin.sh stats
-
-snapshots: ## List restic snapshots
-	./scripts/admin.sh snapshots
-
-check: ## restic integrity check
-	./scripts/admin.sh check
-
-unlock: ## Remove stale restic locks
-	./scripts/admin.sh unlock
-
-restore: ## Restore: make restore SNAP=<id> SUB=<subpath>
-	./scripts/admin.sh restore $(SNAP) $(SUB)
-
-shell: ## Open a shell in a throwaway container of the image
+shell: ## Open a shell in a throwaway container of the mirror image
 	docker run --rm -it --entrypoint /bin/bash onedrive-nas:latest
+
+ui: ## Print the Backrest URL (snapshots/restore/stats/check/prune all live there)
+	@echo "Backrest UI: http://localhost:9898 (or http://<pi-ip>:9898)"
