@@ -78,10 +78,9 @@ services:
   #   1. Create a web UI admin account.
   #   2. Add a repository — URI: /repos/onedrive-nas, Password: RESTIC_PASSWORD
   #      from .env. No extra flags needed; the repo is now mounted read-write.
-  #   3. Add a plan — source path /data/mirror, a cron backup schedule, and a
-  #      retention policy.
-  #   4. On the repository, set a separate prune/check maintenance schedule
-  #      (recommend a fixed off-peak hour — prune is the heaviest restic op).
+  #      Set its Forget Policy (retention) and Prune Policy (schedule) here —
+  #      both are repository-level settings in current Backrest versions.
+  #   3. Add a plan — source path /data/mirror and a cron backup schedule.
   # See README for the full walkthrough.
   # ---------------------------------------------------------------------------
   backrest:

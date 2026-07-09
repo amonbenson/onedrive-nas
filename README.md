@@ -86,23 +86,46 @@ Open `http://<pi-ip>:9898`. On first run:
 2. Add a repository:
    - **URI:** `/repos/onedrive-nas`
    - **Password:** your `.env`'s `RESTIC_PASSWORD`
-   - No extra flags needed — the repo is mounted read-write, so Backrest can
-     lock, write, and prune it directly.
+   - **Forget Policy** — schedule: Cron `0 3 * * *` (daily, 04:00 — one hour
+     after the backup). Choose **Retention Type: By Time Period**:
+     - Hourly: `0` (disabled — meaningless with a once-daily backup schedule)
+     - Daily: `7`
+     - Weekly: `4`
+     - Monthly: `6`
+     - Yearly: `0` (disabled)
+     Each field means "keep one snapshot per calendar period, for the last N
+     periods that actually have a snapshot" (this is restic's own
+     `--keep-daily`/`--keep-weekly`/etc. semantics, which Backrest's "By Time
+     Period" option wraps directly — buckets are calendar-aligned, e.g. a
+     week is Monday-Sunday, not a rolling 7 days from now). Sized to fit the
+     ~600-800 GB repo budget in `.env.example`'s storage-budget note; loosen
+     later once `make ui` → repository stats shows headroom.
+   - **Prune Policy** — schedule: Cron `0 4 * * 0` (**weekly**, Sunday 05:00
+     — deliberately *not* daily). Prune is the heavy step: it walks the repo
+     and physically reclaims space forget marked as unreferenced. Its RAM
+     cost scales with the size of the repo's index, not with how much there
+     is to clean up, so running it more often doesn't lower peak memory per
+     run — it just makes the Pi do the expensive operation more frequently.
+     Keeping it weekly and off-peak is the actual mitigation for the
+     1 GB-RAM constraint (see Caveats below).
+   - **Check Policy** — schedule: Cron `0 5 1 * *` (**monthly**, 1st at
+     06:00), with the read-data-subset % set to `0` (structural check only —
+     reading actual pack data on a spinning HDD is slow; only raise this if
+     you suspect corruption). Monthly is plenty for a personal backup.
 3. Add a plan:
    - **Source path:** `/data/mirror`
-   - **Backup schedule:** a cron expression, e.g. `0 3 * * *` for daily at
-     03:00.
-   - **Retention policy:** time-based, e.g. keep-daily 7 / keep-weekly 4 /
-     keep-monthly 6 — tune to stay within the storage budget (see
-     `.env.example`).
-4. On the repository's own settings, set a separate **prune/check**
-   maintenance schedule (recommend a fixed off-peak hour, e.g. weekly at
-   `0 4 * * 0` — prune is the heaviest restic operation; see Caveats below).
-5. Click **"Index Snapshots"** if you have pre-existing snapshots to import.
+   - **Backup schedule:** `0 2 * * *` (daily, 03:00).
+4. Click **"Index Snapshots"** if you have pre-existing snapshots to import.
 
-From the UI you can browse any snapshot, restore individual files or a whole
-snapshot to a target path, view repository stats, and run check/prune on
-demand.
+The four jobs are staggered by an hour each to avoid lock
+contention if they ever land on the same day:
+
+| Job | Cron | Frequency |
+|-------|------|-----------|
+| Backup | 0 2 * * * | daily |
+| Forget | 0 3 * * 0 | weekly (Sunday) |
+| Prune | 0 4 * * 0 | weekly (Sunday) |
+| Check | 0 5 1 * * | monthly (1st) |
 
 ---
 
@@ -127,8 +150,8 @@ make ui          # print the Backrest URL
 
 Everything else — repository stats, snapshot listing, integrity checks, lock
 management, retention tuning — lives in the Backrest UI. After a few weeks,
-check repo size there, check `df -h /mnt/hdd`, and tune retention in the
-Backrest plan/repo settings to keep `mirror + repo` comfortably under 2 TB.
+check repo size there, check `df -h /mnt/hdd`, and tune the repository's
+Forget Policy to keep `mirror + repo` comfortably under 2 TB.
 
 ---
 
